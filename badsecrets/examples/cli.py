@@ -60,6 +60,8 @@ class BaseReport:
         print(f"Product: {self.x['product']}")
         print(f"Secret Type: {self.x['description']['secret']}")
         print(f"Location: {self.x['location']}")
+        if "confidence" in self.x:
+            print(f"Confidence: {self.x['confidence']}")
 
 
 class ReportSecret(BaseReport):

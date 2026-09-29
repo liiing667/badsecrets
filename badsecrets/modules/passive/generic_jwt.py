@@ -27,9 +27,70 @@ XMLDSIG_table = {
 
 
 class Generic_JWT(BadsecretsBase):
-    identify_regex = re.compile(r"eyJ(?:[\w-]*\.)(?:[\w-]*\.)[\w-]*")
-    yara_carve_pattern = r"eyJ[\w\-]+\.[\w\-]+\.[\w\-]+"
+    # Structural shape of a JWS compact serialization: three base64url segments.
+    # Kept as a class attribute for consistency with other modules, but the real
+    # matching logic lives in identify_confidence() below, which validates the
+    # decoded structure instead of relying on the "eyJ" prefix. The prefix is
+    # just base64url('{"...') and varies with JSON formatting ("{ " -> "eyA",
+    # "{\n" -> "ewo", "{\t" -> "ewk"), so prefix matching both false-positives
+    # on any base64'd JSON fragment and false-negatives on non-compact headers.
+    identify_regex = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$")
+    yara_carve_pattern = r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
     description = {"product": "JSON Web Token (JWT)", "secret": "HMAC/RSA Key", "severity": "HIGH"}
+
+    _bearer_prefix_regex = re.compile(r"^Bearer\s+(\S+)$", re.IGNORECASE)
+    _base64url_segment_regex = re.compile(r"^[A-Za-z0-9_-]+$")
+
+    @classmethod
+    def _normalize_token(cls, product):
+        """Strip surrounding whitespace and an optional RFC 6750 'Bearer ' scheme prefix."""
+        token = product.strip()
+        m = cls._bearer_prefix_regex.match(token)
+        if m:
+            token = m.group(1)
+        return token
+
+    @staticmethod
+    def _decode_json_segment(segment):
+        """base64url-decode a JWT segment and JSON-parse it. Returns the decoded
+        object, or None if the segment is not valid base64url-encoded JSON."""
+        try:
+            padded = segment + "=" * (-len(segment) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+            return json.loads(decoded)
+        except Exception:
+            return None
+
+    @classmethod
+    def identify_confidence(cls, product):
+        """Structurally validate a JWT candidate.
+
+        Returns:
+            "high" - three base64url segments; header decodes to a JSON object
+                     containing "alg"; payload decodes to a JSON object.
+            "low"  - JWT-shaped (three segments, JSON object header) but missing
+                     "alg" or carrying a non-JSON payload.
+            None   - not a JWT.
+        """
+        if not isinstance(product, str):
+            return None
+        parts = cls._normalize_token(product).split(".")
+        if len(parts) != 3:
+            return None
+        header_segment, payload_segment, signature_segment = parts
+        # Header and payload must be non-empty; the signature may be empty (alg=none)
+        if not header_segment or not payload_segment:
+            return None
+        for segment in (header_segment, payload_segment, signature_segment):
+            if segment and not cls._base64url_segment_regex.match(segment):
+                return None
+        header = cls._decode_json_segment(header_segment)
+        if not isinstance(header, dict):
+            return None
+        payload = cls._decode_json_segment(payload_segment)
+        if "alg" in header:
+            return "high" if isinstance(payload, dict) else "low"
+        return "low"
 
     @staticmethod
     def swap_algorithm(jwt, algorithm):
@@ -43,7 +104,35 @@ class Generic_JWT(BadsecretsBase):
         return new_jwt
 
     def carve_regex(self):
-        return re.compile(r"(eyJ(?:[\w-]*\.)(?:[\w-]*\.)[\w-]*)")
+        return re.compile(r"([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*)")
+
+    def _carve_body(self, body, cookies, headers, **kwargs):
+        """Carve JWTs from body text.
+
+        Overrides the base implementation (which only inspects the first regex
+        match) so every candidate is structurally validated in order. This keeps
+        results stable when shape-like noise (e.g. "1.2.3") appears before a real
+        token, and deduplicates repeated occurrences of the same token.
+        """
+        results = []
+        seen = set()
+        for s in re.finditer(self.carve_regex(), body):
+            candidate = s.groups()[0]
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if not self.identify(candidate):
+                continue
+            r = self.check_secret(candidate)
+            if r:
+                r["type"] = "SecretFound"
+            else:
+                r = {"type": "IdentifyOnly"}
+                r["hashcat"] = self._safe_hashcat(candidate)
+            r["product"] = candidate
+            r["location"] = "body"
+            results.append(r)
+        return results
 
     def jwtVerify(self, JWT, key, algorithm):
         try:
@@ -63,6 +152,7 @@ class Generic_JWT(BadsecretsBase):
             return None
 
     def jwtLoad(self, JWT):
+        JWT = self._normalize_token(JWT)
         try:
             jwt_headers = j.get_unverified_header(JWT)
         # if the JWT is not well formed, stop here

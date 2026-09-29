@@ -167,6 +167,11 @@ class BadsecretsBase:
 
         for r in results:
             r["description"] = self.get_description()
+            if r["type"] == "SecretFound":
+                # A cracked secret is definitive
+                r["confidence"] = "high"
+            else:
+                r["confidence"] = self.identify_confidence(r["product"]) or "low"
 
         # Don't report an IdentifyOnly result if we have a SecretFound result for the same 'product'
         secret_found_results = {d["product"] for d in results if d["type"] == "SecretFound"}
@@ -209,9 +214,19 @@ class BadsecretsBase:
 
     @classmethod
     def identify(cls, product):
+        return cls.identify_confidence(product) is not None
+
+    @classmethod
+    def identify_confidence(cls, product):
+        """Return "high"/"low" confidence that product is this module's product, or None.
+
+        Modules with structural validation (e.g. Generic_JWT) override this to
+        distinguish fully-validated structures ("high") from shape-only matches
+        ("low"). The default treats any identify_regex match as "high".
+        """
         if re.match(cls.identify_regex, product):
-            return True
-        return False
+            return "high"
+        return None
 
     @staticmethod
     def search_dict(d, query):
@@ -414,6 +429,7 @@ def check_all_modules(*args, **kwargs):
         r = x.check_secret(*args[0 : x.check_secret_args])
         if r:
             r["type"] = "SecretFound"
+            r["confidence"] = "high"
             r["detecting_module"] = m.__name__
             r["description"] = x.get_description()
             if "product" not in r:
@@ -428,6 +444,7 @@ def check_all_modules(*args, **kwargs):
                 {
                     "type": "IdentifyOnly",
                     "product": args[0],
+                    "confidence": x.identify_confidence(args[0]) or "low",
                     "hashcat": None,
                     "detecting_module": m.__name__,
                     "description": x.get_description(),
